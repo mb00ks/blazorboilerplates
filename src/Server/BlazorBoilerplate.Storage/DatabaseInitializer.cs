@@ -1,0 +1,415 @@
+﻿using BlazorBoilerplate.Infrastructure.AuthorizationDefinitions;
+using BlazorBoilerplate.Infrastructure.Storage;
+using BlazorBoilerplate.Infrastructure.Storage.DataModels;
+using BlazorBoilerplate.Shared;
+using BlazorBoilerplate.Shared.SqlLocalizer;
+using Finbuckle.MultiTenant;
+using IdentityModel;
+using IdentityServer4.EntityFramework.DbContexts;
+using IdentityServer4.EntityFramework.Mappers;
+using Karambolo.Common;
+using Karambolo.PO;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Security.Claims;
+using System.Threading.Tasks;
+using ApiLogItem = BlazorBoilerplate.Infrastructure.Storage.DataModels.ApiLogItem;
+using UserProfile = BlazorBoilerplate.Infrastructure.Storage.DataModels.UserProfile;
+
+namespace BlazorBoilerplate.Storage
+{
+    public class DatabaseInitializer : IDatabaseInitializer
+    {
+        private const string adminRoleName = DefaultRoleNames.Administrator;
+        private const string userRoleName = DefaultRoleNames.User;
+
+        private readonly LocalizationDbContext _localizationDbContext;
+        private readonly PersistedGrantDbContext _persistedGrantContext;
+        private readonly ConfigurationDbContext _configurationContext;
+        private readonly ApplicationDbContext _context;
+        private readonly TenantStoreDbContext _tenantStoreDbContext;
+        private readonly UserManager<ApplicationUser> _userManager;
+        private readonly RoleManager<ApplicationRole> _roleManager;
+        private readonly ApplicationPermissions _applicationPermissions;
+        private readonly ILogger _logger;
+        private readonly IWebHostEnvironment _environment;
+
+        public DatabaseInitializer(
+            TenantStoreDbContext tenantStoreDbContext,
+            LocalizationDbContext localizationDbContext,
+            ApplicationDbContext context,
+            PersistedGrantDbContext persistedGrantContext,
+            ConfigurationDbContext configurationContext,
+            UserManager<ApplicationUser> userManager,
+            RoleManager<ApplicationRole> roleManager,
+            ApplicationPermissions applicationPermissions,
+            ILogger<DatabaseInitializer> logger, IWebHostEnvironment env)
+        {
+            _tenantStoreDbContext = tenantStoreDbContext;
+            _localizationDbContext = localizationDbContext;
+            _persistedGrantContext = persistedGrantContext;
+            _configurationContext = configurationContext;
+            _context = context;
+            _userManager = userManager;
+            _roleManager = roleManager;
+            _applicationPermissions = applicationPermissions;
+            _logger = logger;
+            _environment = env;
+        }
+
+        public virtual async Task SeedAsync()
+        {
+            //Apply EF Core migration
+            await MigrateAsync();
+
+            await ImportTrasnlations();
+
+            await EnsureAdminIdentitiesAsync();
+
+            await SeedIdentityServerAsync();
+
+            //Seed blazorboilerplate sample data
+            await SeedDemoDataAsync();
+        }
+
+        private async Task MigrateAsync()
+        {
+            await _tenantStoreDbContext.Database.MigrateAsync();
+            await _localizationDbContext.Database.MigrateAsync();
+            await _context.Database.MigrateAsync();
+            await _persistedGrantContext.Database.MigrateAsync();
+            await _configurationContext.Database.MigrateAsync();
+        }
+
+        private async Task ImportTrasnlations()
+        {
+            try
+            {
+                if (!await _localizationDbContext.LocalizationRecords.AnyAsync())
+                {
+                    _logger.LogInformation("Importing PO files in db");
+
+                    var basePath = "Localization";
+
+                    IReadOnlyDictionary<string, POCatalog> TextCatalogs = new Dictionary<string, POCatalog>();
+
+                    var cultures = _environment.ContentRootFileProvider.GetDirectoryContents(basePath)
+                        .Where(fi => fi.IsDirectory)
+                        .Select(fi => fi.Name)
+                        .ToArray();
+
+                    var textCatalogFiles = cultures.SelectMany(
+                        c => _environment.ContentRootFileProvider.GetDirectoryContents(Path.Combine(basePath, c))
+                        .Where(fi => !fi.IsDirectory && ".po".Equals(Path.GetExtension(fi.Name), StringComparison.OrdinalIgnoreCase)),
+                        (c, f) => (Culture: c, FileInfo: f));
+
+                    var textCatalogs = new List<(string FileName, string Culture, POCatalog Catalog)>();
+
+                    var parserSettings = new POParserSettings
+                    {
+                        SkipComments = true,
+                        SkipInfoHeaders = true,
+                    };
+
+                    Parallel.ForEach(textCatalogFiles,
+                        () => new POParser(parserSettings),
+                        (it, s, p) =>
+                        {
+                            POParseResult result;
+                            using (var stream = it.FileInfo.CreateReadStream())
+                                result = p.Parse(new StreamReader(stream));
+
+                            if (result.Success)
+                            {
+                                lock (textCatalogs)
+                                    textCatalogs.Add((it.FileInfo.Name, it.Culture, result.Catalog));
+                            }
+                            else
+                                _logger.LogWarning("Translation file \"{FILE}\" has errors.", Path.Combine(basePath, it.Culture, it.FileInfo.Name));
+
+                            return p;
+                        },
+                        Noop<POParser>.Action);
+
+                    TextCatalogs = textCatalogs
+                        .GroupBy(it => it.Culture, it => (it.FileName, it.Catalog))
+                        .ToDictionary(g => g.Key, g => g
+                            .OrderBy(it => it.FileName)
+                            .Select(it => it.Catalog)
+                            .Aggregate((acc, src) =>
+                            {
+                                foreach (var entry in src)
+                                    try { acc.Add(entry); }
+                                    catch (ArgumentException) { _logger.LogWarning("Multiple translations for key {KEY}.", FormatKey(entry.Key)); }
+
+                                return acc;
+                            }));
+
+                    foreach (var textCatalog in TextCatalogs)
+                    {
+                        foreach (var item in textCatalog.Value)
+                        {
+                            foreach (var entry in item)
+                                _localizationDbContext.Add(new LocalizationRecord()
+                                {
+                                    LocalizationCulture = textCatalog.Key,
+                                    Key = item.Key.Id,
+                                    Text = entry,
+                                    ResourceKey = item.Key.ContextId ?? nameof(Global)
+                                });
+                        }
+
+                        await _localizationDbContext.SaveChangesAsync();
+                    }
+
+                    SqlStringLocalizerFactory.SetLocalizationRecords(_localizationDbContext.LocalizationRecords);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError("Importing PO files in db error: {0}", ex.Message);
+            }
+        }
+
+        public string FormatKey(POKey key)
+        {
+            var result = string.Concat("'", key.Id, "'");
+            if (key.PluralId != null)
+                result = string.Concat(result, "-'", key.PluralId, "'");
+            if (key.ContextId != null)
+                result = string.Concat(result, "@'", key.ContextId, "'");
+
+            return result;
+        }
+
+        private async Task SeedDemoDataAsync()
+        {
+            if ((await _userManager.FindByNameAsync(DefaultUserNames.User)) == null)
+            {
+                await EnsureRoleAsync(userRoleName, "Default user", new string[] { });
+                await CreateUserAsync(DefaultUserNames.User, "user123", DefaultRoleNames.User, "Blazor", "User Blazor", "user@blazoreboilerplate.com", "+1 (123) 456-7890", new string[] { userRoleName });
+            }
+
+            if (_tenantStoreDbContext.TenantInfo.Count() < 2)
+            {
+                _tenantStoreDbContext.TenantInfo.Add(new TenantInfo() { Id = "tenant1", Identifier = "tenant1.local", Name = "Microsoft Inc." });
+                _tenantStoreDbContext.TenantInfo.Add(new TenantInfo() { Id = "tenant2", Identifier = "tenant2.local", Name = "Contoso Corp." });
+
+                _tenantStoreDbContext.SaveChanges();
+            }
+
+            ApplicationUser user = await _userManager.FindByNameAsync(DefaultUserNames.User);
+
+            if (!_context.UserProfiles.Any())
+                _context.UserProfiles.Add(new UserProfile
+                {
+                    UserId = user.Id,
+                    ApplicationUser = user,
+                    Count = 2,
+                    IsNavOpen = true,
+                    LastPageVisited = "/dashboard",
+                    IsNavMinified = false,
+                    LastUpdatedDate = DateTime.Now
+                });
+
+            if (!_context.Todos.Any())
+                _context.Todos.AddRange(
+                        new Todo
+                        {
+                            IsCompleted = false,
+                            Title = "Test BlazorBoilerplate"
+                        },
+                        new Todo
+                        {
+                            IsCompleted = false,
+                            Title = "Test BlazorBoilerplate 1",
+                        }
+                );
+
+            if (!_context.ApiLogs.Any())
+            {
+                _context.ApiLogs.AddRange(
+                new ApiLogItem
+                {
+                    RequestTime = DateTime.Now,
+                    ResponseMillis = 30,
+                    StatusCode = 200,
+                    Method = "Get",
+                    Path = "/api/seed",
+                    QueryString = "",
+                    RequestBody = "",
+                    ResponseBody = "",
+                    IPAddress = "::1",
+                    ApplicationUserId = user.Id
+                },
+                new ApiLogItem
+                {
+                    RequestTime = DateTime.Now,
+                    ResponseMillis = 30,
+                    StatusCode = 200,
+                    Method = "Get",
+                    Path = "/api/seed",
+                    QueryString = "",
+                    RequestBody = "",
+                    ResponseBody = "",
+                    IPAddress = "::1",
+                    ApplicationUserId = user.Id
+                }
+            );
+            }
+
+            _context.SaveChanges();
+        }
+
+        private async Task SeedIdentityServerAsync()
+        {
+            if (!await _configurationContext.ApiScopes.AnyAsync())
+            {
+                _logger.LogInformation("Seeding IdentityServer API Scopes");
+                foreach (var scope in IdentityServerConfig.GetApiScopes)
+                    _configurationContext.ApiScopes.Add(scope.ToEntity());
+
+                await _configurationContext.SaveChangesAsync();
+            }
+
+            if (!await _configurationContext.Clients.AnyAsync())
+            {
+                _logger.LogInformation("Seeding IdentityServer Clients");
+                foreach (var client in IdentityServerConfig.GetClients)
+                    _configurationContext.Clients.Add(client.ToEntity());
+
+                await _configurationContext.SaveChangesAsync();
+            }
+
+            if (!await _configurationContext.IdentityResources.AnyAsync())
+            {
+                _logger.LogInformation("Seeding IdentityServer Identity Resources");
+                foreach (var resource in IdentityServerConfig.GetIdentityResources)
+                    _configurationContext.IdentityResources.Add(resource.ToEntity());
+
+                await _configurationContext.SaveChangesAsync();
+            }
+
+            if (!await _configurationContext.ApiResources.AnyAsync())
+            {
+                _logger.LogInformation("Seeding IdentityServer API Resources");
+                foreach (var resource in IdentityServerConfig.GetApiResources)
+                    _configurationContext.ApiResources.Add(resource.ToEntity());
+
+                await _configurationContext.SaveChangesAsync();
+            }
+        }
+
+        public async Task EnsureAdminIdentitiesAsync()
+        {
+            await EnsureRoleAsync(DefaultRoleNames.Administrator, "Default administrator", _applicationPermissions.GetAllPermissionValues());
+            await CreateUserAsync(DefaultUserNames.Administrator, "admin123", "Admin", "Blazor", DefaultRoleNames.Administrator, "admin@blazoreboilerplate.com", "+1 (123) 456-7890", new string[] { DefaultRoleNames.Administrator });
+
+            ApplicationRole adminRole = await _roleManager.FindByNameAsync(adminRoleName);
+            var AllClaims = _applicationPermissions.GetAllPermissionValues().Distinct();
+            var RoleClaims = (await _roleManager.GetClaimsAsync(adminRole)).Select(c => c.Value).ToList();
+            var NewClaims = AllClaims.Except(RoleClaims);
+
+            foreach (string claim in NewClaims)
+                await _roleManager.AddClaimAsync(adminRole, new Claim(ClaimConstants.Permission, claim));
+
+            var DeprecatedClaims = RoleClaims.Except(AllClaims);
+            var roles = await _roleManager.Roles.ToListAsync();
+
+            foreach (string claim in DeprecatedClaims)
+                foreach (var role in roles)
+                    await _roleManager.RemoveClaimAsync(role, new Claim(ClaimConstants.Permission, claim));
+
+            _logger.LogInformation("Inbuilt account generation completed");
+        }
+
+        private async Task EnsureRoleAsync(string roleName, string description, string[] claims)
+        {
+            if ((await _roleManager.FindByNameAsync(roleName)) == null)
+            {
+                if (claims == null)
+                    claims = new string[] { };
+
+                string[] invalidClaims = claims.Where(c => _applicationPermissions.GetPermissionByValue(c) == null).ToArray();
+                if (invalidClaims.Any())
+                    throw new Exception("The following claim types are invalid: " + string.Join(", ", invalidClaims));
+
+                ApplicationRole applicationRole = new ApplicationRole(roleName);
+
+                var result = await _roleManager.CreateAsync(applicationRole);
+
+                ApplicationRole role = await _roleManager.FindByNameAsync(applicationRole.Name);
+
+                foreach (string claim in claims.Distinct())
+                {
+                    result = await _roleManager.AddClaimAsync(role, new Claim(ClaimConstants.Permission, _applicationPermissions.GetPermissionByValue(claim)));
+
+                    if (!result.Succeeded)
+                        await _roleManager.DeleteAsync(role);
+                }
+            }
+        }
+
+        private async Task<ApplicationUser> CreateUserAsync(string userName, string password, string firstName, string fullName, string lastName, string email, string phoneNumber, string[] roles)
+        {
+            var applicationUser = _userManager.FindByNameAsync(userName).Result;
+
+            if (applicationUser == null)
+            {
+                applicationUser = new ApplicationUser
+                {
+                    UserName = userName,
+                    Email = email,
+                    PhoneNumber = phoneNumber,
+                    FullName = fullName,
+                    FirstName = firstName,
+                    LastName = lastName,
+                    EmailConfirmed = true
+                };
+
+                var result = _userManager.CreateAsync(applicationUser, password).Result;
+                if (!result.Succeeded)
+                    throw new Exception(result.Errors.First().Description);
+
+                result = _userManager.AddClaimsAsync(applicationUser, new Claim[]{
+                        new Claim(JwtClaimTypes.Name, userName),
+                        new Claim(JwtClaimTypes.GivenName, firstName),
+                        new Claim(JwtClaimTypes.FamilyName, lastName),
+                        new Claim(JwtClaimTypes.Email, email),
+                        new Claim(JwtClaimTypes.EmailVerified, "true", ClaimValueTypes.Boolean),
+                        new Claim(JwtClaimTypes.PhoneNumber, phoneNumber)
+                    }).Result;
+
+                //add claims version of roles
+                foreach (var role in roles.Distinct())
+                {
+                    await _userManager.AddClaimAsync(applicationUser, new Claim($"Is{role}", "true"));
+                }
+
+                ApplicationUser user = await _userManager.FindByNameAsync(applicationUser.UserName);
+
+                try
+                {
+                    result = await _userManager.AddToRolesAsync(user, roles.Distinct());
+                }
+                catch
+                {
+                    await _userManager.DeleteAsync(user);
+                    throw;
+                }
+
+                if (!result.Succeeded)
+                {
+                    await _userManager.DeleteAsync(user);
+                }
+            }
+            return applicationUser;
+        }
+    }
+}
